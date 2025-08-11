@@ -1,0 +1,277 @@
+const express = require('express');
+const router = express.Router();
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+
+// Importar los modelos
+const Client = require('../models/Client');
+const Credit = require('../models/Credit');
+const User = require('../models/User');
+
+// --- LÓGICA DE CÁLCULO DE FECHAS ---
+// Esta función ahora vive en el backend, donde debe estar.
+function calculateNextPaymentDate(creditData) {
+  const today = new Date();
+  let nextDate = new Date();
+  today.setHours(0, 0, 0, 0);
+  nextDate.setHours(0, 0, 0, 0);
+
+  if (creditData.paymentFrequency === 'semanal') {
+    const paymentDay = parseInt(creditData.paymentDayOfWeek, 10);
+    const currentDay = today.getDay() === 0 ? 7 : today.getDay(); // Domingo = 7
+    let daysUntilNext = (paymentDay - currentDay + 7) % 7;
+    // Si el día de pago coincide con hoy, se programa para la siguiente semana
+    if (daysUntilNext === 0) {
+      daysUntilNext = 7;
+    }
+    nextDate.setDate(today.getDate() + daysUntilNext);
+  } else if (creditData.paymentFrequency === 'quincenal') {
+    const sortedDays = creditData.paymentDaysOfMonth.sort((a, b) => a - b);
+    // Busca el próximo día de pago en el mes actual
+    let targetDay = sortedDays.find(day => day > today.getDate());
+    if (targetDay) {
+      // Si se encuentra, se establece ese día
+      nextDate.setDate(targetDay);
+    } else {
+      // Si no, se establece el primer día de pago en el mes siguiente
+      nextDate.setMonth(today.getMonth() + 1);
+      nextDate.setDate(sortedDays[0]);
+    }
+  }
+  return nextDate;
+}
+
+// --- RUTA DE AUTENTICACIÓN ---
+
+// POST /api/login
+router.post('/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ message: "Usuario y contraseña son requeridos." });
+    }
+    const user = await User.findOne({ username: username.toLowerCase() });
+    if (!user) {
+      return res.status(401).json({ message: "Credenciales incorrectas" });
+    }
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Credenciales incorrectas" });
+    }
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      process.env.JWT_SECRET || 'una-clave-secreta-muy-segura-para-desarrollo',
+      { expiresIn: '30d' }
+    );
+    res.status(200).json({ token });
+  } catch (error) {
+    res.status(500).json({ message: "Error en el servidor durante el inicio de sesión", error });
+  }
+});
+
+
+// --- RUTAS DE CLIENTES ---
+
+router.get('/clients', async (req, res) => {
+  try {
+    const clients = await Client.find({});
+    res.status(200).json(clients);
+  } catch (error) { res.status(500).json({ message: "Error al obtener clientes", error }); }
+});
+
+router.post('/clients', async (req, res) => {
+    try {
+        const newClient = new Client(req.body);
+        await newClient.save();
+        res.status(201).json(newClient);
+    } catch (error) { res.status(400).json({ message: "Error al crear cliente", error }); }
+});
+
+router.get('/clients/:id', async (req, res) => {
+    try {
+        const client = await Client.findById(req.params.id);
+        if (!client) return res.status(404).json({ message: "Cliente no encontrado" });
+        res.status(200).json(client);
+    } catch (error) { res.status(500).json({ message: "Error al buscar cliente", error }); }
+});
+
+router.put('/clients/:id', async (req, res) => {
+    try {
+        const updatedClient = await Client.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        if (!updatedClient) return res.status(404).json({ message: "Cliente no encontrado" });
+        res.status(200).json(updatedClient);
+    } catch (error) { res.status(400).json({ message: "Error al actualizar cliente", error }); }
+});
+
+router.get('/clients/:id/credits', async (req, res) => {
+    try {
+        const credits = await Credit.find({ client: req.params.id });
+        res.status(200).json(credits);
+    } catch (error) { res.status(500).json({ message: "Error al obtener créditos del cliente", error }); }
+});
+
+
+// --- RUTAS DE CRÉDITOS ---
+
+router.get('/credits', async (req, res) => {
+    try {
+        const credits = await Credit.find({}).populate('client', 'fullName cedula');
+        res.status(200).json(credits);
+    } catch (error) { res.status(500).json({ message: "Error al obtener créditos", error }); }
+});
+    
+router.post('/credits', async (req, res) => {
+    try {
+        const creditData = req.body;
+        const totalAmount = creditData.products.reduce((sum, p) => sum + p.price, 0);
+        const nextPaymentDate = calculateNextPaymentDate(creditData); // <-- Lógica clave
+
+        const newCredit = new Credit({
+            ...creditData,
+            totalAmount: totalAmount,
+            originalAmount: totalAmount,
+            remainingInstallments: creditData.installments,
+            paymentHistory: [],
+            completionDate: null,
+            nextPaymentDate: nextPaymentDate,
+        });
+        await newCredit.save();
+        const populatedCredit = await Credit.findById(newCredit._id).populate('client');
+        res.status(201).json(populatedCredit);
+    } catch (error) {
+        res.status(400).json({ message: "Error al crear el crédito", error: error.message });
+    }
+});
+
+router.get('/credits/:id', async (req, res) => {
+    try {
+        const credit = await Credit.findById(req.params.id).populate('client');
+        if (!credit) return res.status(404).json({ message: "Crédito no encontrado" });
+        res.status(200).json(credit);
+    } catch (error) { res.status(500).json({ message: "Error al buscar el crédito", error }); }
+});
+
+router.put('/credits/:id', async (req, res) => {
+    try {
+        const updatedData = req.body;
+        const originalCredit = await Credit.findById(req.params.id);
+        if (!originalCredit) return res.status(404).json({ message: "Crédito no encontrado" });
+        const paidInstallments = originalCredit.installments - originalCredit.remainingInstallments;
+        updatedData.remainingInstallments = updatedData.installments - paidInstallments;
+        if (updatedData.remainingInstallments < 0) updatedData.remainingInstallments = 0;
+        const updatedCredit = await Credit.findByIdAndUpdate(req.params.id, updatedData, { new: true });
+        res.status(200).json(updatedCredit);
+    } catch (error) { res.status(400).json({ message: "Error al actualizar el crédito", error }); }
+});
+
+router.delete('/credits/:id', async (req, res) => {
+    try {
+        const deletedCredit = await Credit.findByIdAndDelete(req.params.id);
+        if (!deletedCredit) return res.status(404).json({ message: "Crédito no encontrado" });
+        res.status(200).json({ message: "Crédito eliminado con éxito" });
+    } catch (error) { res.status(500).json({ message: "Error al eliminar el crédito", error }); }
+});
+
+router.post('/credits/:id/payments', async (req, res) => {
+    try {
+        const credit = await Credit.findById(req.params.id);
+        if (!credit) return res.status(404).json({ message: "Crédito no encontrado" });
+        const { amount } = req.body;
+        credit.paymentHistory.push({ amount, date: new Date() });
+        credit.totalAmount -= amount;
+        credit.remainingInstallments -= 1;
+        if (credit.totalAmount <= 0 || credit.remainingInstallments <= 0) {
+            credit.status = 'pagado';
+            credit.totalAmount = 0;
+            credit.nextPaymentDate = null;
+            credit.completionDate = new Date();
+        }
+        await credit.save();
+        res.status(200).json(credit);
+    } catch (error) { res.status(400).json({ message: "Error al registrar el pago", error }); }
+});
+
+// --- NUEVA RUTA PARA AÑADIR PRODUCTOS ---
+router.post('/credits/:id/add-products', async (req, res) => {
+    try {
+        const { newProducts, newTotalInstallments } = req.body;
+        const credit = await Credit.findById(req.params.id);
+
+        if (!credit || credit.status === 'pagado') {
+            return res.status(404).json({ message: "Crédito no encontrado o ya está pagado." });
+        }
+        if (!newProducts || newProducts.length === 0 || !newTotalInstallments) {
+            return res.status(400).json({ message: "Datos incompletos." });
+        }
+
+        const newProductsValue = newProducts.reduce((sum, p) => sum + p.price, 0);
+        const newTotalAmount = credit.totalAmount + newProductsValue;
+        const paidInstallments = credit.installments - credit.remainingInstallments;
+
+        credit.products.push(...newProducts);
+        credit.totalAmount = newTotalAmount;
+        credit.originalAmount += newProductsValue;
+        credit.installments = newTotalInstallments;
+        credit.remainingInstallments = newTotalInstallments - paidInstallments;
+
+        if (credit.remainingInstallments < 0) {
+            credit.remainingInstallments = 0;
+        }
+
+        await credit.save();
+        res.status(200).json(credit);
+
+    } catch (error) {
+        res.status(400).json({ message: "Error al añadir productos al crédito", error: error.message });
+    }
+});
+
+// --- RUTAS DE AGENDA Y REPORTES ---
+
+router.get('/agenda', async (req, res) => {
+    try {
+        const activeCredits = await Credit.find({ status: 'activo' }).populate('client', 'fullName cedula');
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const upcomingLimit = new Date(today);
+        upcomingLimit.setDate(today.getDate() + 7);
+        const overdue = [];
+        const todayPayments = [];
+        const upcoming = [];
+        activeCredits.forEach(credit => {
+            if (!credit.nextPaymentDate) return;
+            const nextPayment = new Date(credit.nextPaymentDate);
+            nextPayment.setHours(0, 0, 0, 0);
+            if (nextPayment < today) overdue.push(credit);
+            else if (nextPayment.getTime() === today.getTime()) todayPayments.push(credit);
+            else if (nextPayment > today && nextPayment <= upcomingLimit) upcoming.push(credit);
+        });
+        res.status(200).json({ overdue, today: todayPayments, upcoming });
+    } catch (error) { res.status(500).json({ message: "Error al generar la agenda", error }); }
+});
+
+router.get('/reports/summary', async (req, res) => {
+    try {
+        const totalDueResult = await Credit.aggregate([ { $match: { status: 'activo' } }, { $group: { _id: null, total: { $sum: '$totalAmount' } } } ]);
+        const totalDue = totalDueResult.length > 0 ? totalDueResult[0].total : 0;
+        const allPayments = await Credit.aggregate([ { $unwind: '$paymentHistory' } ]);
+        const totalCollected = allPayments.reduce((sum, p) => sum + p.paymentHistory.amount, 0);
+        const today = new Date();
+        const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+        const currentMonthCollected = allPayments
+            .filter(p => new Date(p.paymentHistory.date) >= startOfMonth)
+            .reduce((sum, p) => sum + p.paymentHistory.amount, 0);
+        res.status(200).json({ totalDue, totalCollected, currentMonthCollected });
+    } catch (error) { res.status(500).json({ message: "Error al generar el resumen", error }); }
+});
+
+router.get('/reports/completed-sales', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) return res.status(400).json({ message: "Se requieren fechas de inicio y fin." });
+        const sales = await Credit.find({ status: 'pagado', completionDate: { $gte: new Date(startDate), $lte: new Date(new Date(endDate).setHours(23, 59, 59, 999)) } }).populate('client', 'fullName cedula');
+        res.status(200).json(sales);
+    } catch (error) { res.status(500).json({ message: "Error al obtener ventas completadas", error }); }
+});
+
+module.exports = router;
