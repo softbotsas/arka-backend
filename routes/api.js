@@ -244,15 +244,29 @@ router.put('/credits/:id/payments/:paymentIndex', async (req, res) => {
         // Actualizar el monto del pago
         credit.paymentHistory[paymentIndex].amount = amount;
         
-        // Recalcular el totalAmount
-        credit.totalAmount = credit.totalAmount + oldAmount - amount;
+        // Recalcular el totalAmount correctamente
+        // Primero sumamos el monto anterior (deshacer el pago anterior)
+        credit.totalAmount = credit.totalAmount + oldAmount;
+        // Luego restamos el nuevo monto
+        credit.totalAmount = credit.totalAmount - amount;
         
-        // Verificar si el crédito debe marcarse como pagado
-        if (credit.totalAmount <= 0) {
+        // Recalcular las cuotas restantes
+        const totalPaid = credit.paymentHistory.reduce((sum, payment) => sum + payment.amount, 0);
+        const originalAmount = credit.originalAmount;
+        const remainingAmount = originalAmount - totalPaid;
+        
+        // Calcular cuotas restantes basado en el monto restante
+        if (remainingAmount <= 0) {
             credit.status = 'pagado';
             credit.totalAmount = 0;
+            credit.remainingInstallments = 0;
             credit.nextPaymentDate = null;
             credit.completionDate = new Date();
+        } else {
+            // Recalcular cuotas restantes basado en el monto restante
+            const installmentValue = originalAmount / credit.installments;
+            credit.remainingInstallments = Math.ceil(remainingAmount / installmentValue);
+            credit.totalAmount = remainingAmount;
         }
         
         await credit.save();
@@ -277,11 +291,15 @@ router.delete('/credits/:id/payments/:paymentIndex', async (req, res) => {
         // Eliminar el pago del historial
         credit.paymentHistory.splice(paymentIndex, 1);
         
-        // Recalcular el totalAmount (sumar el monto eliminado)
-        credit.totalAmount += deletedPayment.amount;
+        // Recalcular todo desde cero
+        const totalPaid = credit.paymentHistory.reduce((sum, payment) => sum + payment.amount, 0);
+        const originalAmount = credit.originalAmount;
+        const remainingAmount = originalAmount - totalPaid;
         
-        // Recalcular las cuotas restantes (sumar 1 cuota)
-        credit.remainingInstallments += 1;
+        // Recalcular cuotas restantes
+        const installmentValue = originalAmount / credit.installments;
+        credit.remainingInstallments = Math.ceil(remainingAmount / installmentValue);
+        credit.totalAmount = remainingAmount;
         
         // Si el crédito estaba marcado como pagado, volver a activo
         if (credit.status === 'pagado') {
