@@ -122,6 +122,18 @@ router.get('/credits', async (req, res) => {
         res.status(200).json(credits);
     } catch (error) { res.status(500).json({ message: "Error al obtener créditos", error }); }
 });
+
+// Ruta para obtener créditos completados
+router.get('/credits/completed', async (req, res) => {
+    try {
+        const completedCredits = await Credit.find({ status: 'pagado' })
+            .populate('client', 'fullName cedula')
+            .sort({ completionDate: -1 }); // Más recientes primero
+        res.status(200).json(completedCredits);
+    } catch (error) { 
+        res.status(500).json({ message: "Error al obtener créditos completados", error }); 
+    }
+});
     
 router.post('/credits', async (req, res) => {
     try {
