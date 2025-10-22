@@ -361,19 +361,32 @@ router.get('/agenda', async (req, res) => {
         const today = new Date(colombiaTime);
         today.setHours(0, 0, 0, 0);
         
+        // Fecha límite para próximos cobros (7 días)
+        const upcomingLimit = new Date(today);
+        upcomingLimit.setDate(today.getDate() + 7);
+        
         const todayPayments = [];
+        const upcomingPayments = [];
+        
         activeCredits.forEach(credit => {
             if (!credit.nextPaymentDate) return;
             const nextPayment = new Date(credit.nextPaymentDate);
             nextPayment.setHours(0, 0, 0, 0);
             
-            // Solo incluir créditos que se deben pagar exactamente hoy
+            // Cobros de hoy
             if (nextPayment.getTime() === today.getTime()) {
                 todayPayments.push(credit);
             }
+            // Próximos cobros (hasta 7 días, sin incluir atrasados)
+            else if (nextPayment > today && nextPayment <= upcomingLimit) {
+                upcomingPayments.push(credit);
+            }
         });
         
-        res.status(200).json({ today: todayPayments });
+        res.status(200).json({ 
+            today: todayPayments, 
+            upcoming: upcomingPayments 
+        });
     } catch (error) { res.status(500).json({ message: "Error al generar la agenda", error }); }
 });
 
