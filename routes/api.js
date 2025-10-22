@@ -12,28 +12,30 @@ const User = require('../models/User');
 // Esta función ahora vive en el backend, donde debe estar.
 function calculateNextPaymentDate(creditData) {
   const today = new Date();
-  let nextDate = new Date();
-  today.setHours(0, 0, 0, 0);
-  nextDate.setHours(0, 0, 0, 0);
+  // Corrección: Asegurarse de que 'today' esté al inicio del día en la zona horaria del servidor
+  today.setHours(0, 0, 0, 0); 
+
+  let nextDate = new Date(today.getTime());
 
   if (creditData.paymentFrequency === 'semanal') {
     const paymentDay = parseInt(creditData.paymentDayOfWeek, 10);
-    const currentDay = today.getDay() === 0 ? 7 : today.getDay(); // Domingo = 7
-    let daysUntilNext = (paymentDay - currentDay + 7) % 7;
-    // Si el día de pago coincide con hoy, se programa para la siguiente semana
-    if (daysUntilNext === 0) {
-      daysUntilNext = 7;
+    // En JS, Domingo=0, Lunes=1... Sábado=6. En nuestro sistema, Lunes=1... Domingo=7
+    const currentDayJS = today.getDay(); // 0-6
+    const paymentDayJS = paymentDay % 7; // Convertimos nuestro Domingo=7 a Domingo=0
+
+    let daysUntilNext = paymentDayJS - currentDayJS;
+    if (daysUntilNext <= 0) {
+      daysUntilNext += 7; // Si el día ya pasó o es hoy, sumar 7 días
     }
+    
     nextDate.setDate(today.getDate() + daysUntilNext);
+    
   } else if (creditData.paymentFrequency === 'quincenal') {
     const sortedDays = creditData.paymentDaysOfMonth.sort((a, b) => a - b);
-    // Busca el próximo día de pago en el mes actual
     let targetDay = sortedDays.find(day => day > today.getDate());
     if (targetDay) {
-      // Si se encuentra, se establece ese día
       nextDate.setDate(targetDay);
     } else {
-      // Si no, se establece el primer día de pago en el mes siguiente
       nextDate.setMonth(today.getMonth() + 1);
       nextDate.setDate(sortedDays[0]);
     }
@@ -115,7 +117,8 @@ router.get('/clients/:id/credits', async (req, res) => {
 
 router.get('/credits', async (req, res) => {
     try {
-        const credits = await Credit.find({}).populate('client', 'fullName cedula');
+        // Solo obtener créditos activos (no completados)
+        const credits = await Credit.find({ status: 'activo' }).populate('client', 'fullName cedula');
         res.status(200).json(credits);
     } catch (error) { res.status(500).json({ message: "Error al obtener créditos", error }); }
 });
@@ -156,9 +159,19 @@ router.put('/credits/:id', async (req, res) => {
         const updatedData = req.body;
         const originalCredit = await Credit.findById(req.params.id);
         if (!originalCredit) return res.status(404).json({ message: "Crédito no encontrado" });
-        const paidInstallments = originalCredit.installments - originalCredit.remainingInstallments;
-        updatedData.remainingInstallments = updatedData.installments - paidInstallments;
-        if (updatedData.remainingInstallments < 0) updatedData.remainingInstallments = 0;
+        
+        // Si se están agregando cuotas adicionales
+        if (updatedData.installments && updatedData.remainingInstallments) {
+            const paidInstallments = originalCredit.installments - originalCredit.remainingInstallments;
+            updatedData.remainingInstallments = updatedData.installments - paidInstallments;
+            if (updatedData.remainingInstallments < 0) updatedData.remainingInstallments = 0;
+        } else {
+            // Lógica normal de actualización
+            const paidInstallments = originalCredit.installments - originalCredit.remainingInstallments;
+            updatedData.remainingInstallments = updatedData.installments - paidInstallments;
+            if (updatedData.remainingInstallments < 0) updatedData.remainingInstallments = 0;
+        }
+        
         const updatedCredit = await Credit.findByIdAndUpdate(req.params.id, updatedData, { new: true });
         res.status(200).json(updatedCredit);
     } catch (error) { res.status(400).json({ message: "Error al actualizar el crédito", error }); }
@@ -180,15 +193,126 @@ router.post('/credits/:id/payments', async (req, res) => {
         credit.paymentHistory.push({ amount, date: new Date() });
         credit.totalAmount -= amount;
         credit.remainingInstallments -= 1;
-        if (credit.totalAmount <= 0 || credit.remainingInstallments <= 0) {
+        
+        // Solo marcar como pagado si realmente se pagó todo el monto
+        if (credit.totalAmount <= 0) {
+            credit.status = 'pagado';
+            credit.totalAmount = 0;
+            credit.nextPaymentDate = null;
+            credit.completionDate = new Date();
+        } else if (credit.remainingInstallments <= 0) {
+            // Si se agotaron las cuotas pero aún hay saldo pendiente
+            // GUARDAR el abono primero, luego devolver información del saldo restante
+            await credit.save();
+            return res.status(200).json({
+                credit,
+                needsMoreInstallments: true,
+                remainingBalance: credit.totalAmount
+            });
+        }
+        await credit.save();
+        res.status(200).json(credit);
+    } catch (error) { res.status(400).json({ message: "Error al registrar el pago", error }); }
+});
+
+// --- RUTAS PARA EDITAR Y ELIMINAR ABONOS ---
+router.put('/credits/:id/payments/:paymentIndex', async (req, res) => {
+    try {
+        const credit = await Credit.findById(req.params.id);
+        if (!credit) return res.status(404).json({ message: "Crédito no encontrado" });
+        
+        const paymentIndex = parseInt(req.params.paymentIndex);
+        if (paymentIndex < 0 || paymentIndex >= credit.paymentHistory.length) {
+            return res.status(400).json({ message: "Índice de pago inválido" });
+        }
+        
+        const { amount } = req.body;
+        const oldAmount = credit.paymentHistory[paymentIndex].amount;
+        
+        // Actualizar el monto del pago
+        credit.paymentHistory[paymentIndex].amount = amount;
+        
+        // Recalcular el totalAmount
+        credit.totalAmount = credit.totalAmount + oldAmount - amount;
+        
+        // Verificar si el crédito debe marcarse como pagado
+        if (credit.totalAmount <= 0) {
             credit.status = 'pagado';
             credit.totalAmount = 0;
             credit.nextPaymentDate = null;
             credit.completionDate = new Date();
         }
+        
         await credit.save();
         res.status(200).json(credit);
-    } catch (error) { res.status(400).json({ message: "Error al registrar el pago", error }); }
+    } catch (error) {
+        res.status(400).json({ message: "Error al editar el abono", error: error.message });
+    }
+});
+
+router.delete('/credits/:id/payments/:paymentIndex', async (req, res) => {
+    try {
+        const credit = await Credit.findById(req.params.id);
+        if (!credit) return res.status(404).json({ message: "Crédito no encontrado" });
+        
+        const paymentIndex = parseInt(req.params.paymentIndex);
+        if (paymentIndex < 0 || paymentIndex >= credit.paymentHistory.length) {
+            return res.status(400).json({ message: "Índice de pago inválido" });
+        }
+        
+        const deletedPayment = credit.paymentHistory[paymentIndex];
+        
+        // Eliminar el pago del historial
+        credit.paymentHistory.splice(paymentIndex, 1);
+        
+        // Recalcular el totalAmount (sumar el monto eliminado)
+        credit.totalAmount += deletedPayment.amount;
+        
+        // Recalcular las cuotas restantes (sumar 1 cuota)
+        credit.remainingInstallments += 1;
+        
+        // Si el crédito estaba marcado como pagado, volver a activo
+        if (credit.status === 'pagado') {
+            credit.status = 'activo';
+            credit.completionDate = null;
+            // Recalcular la próxima fecha de pago
+            credit.nextPaymentDate = calculateNextPaymentDate(credit);
+        }
+        
+        await credit.save();
+        res.status(200).json(credit);
+    } catch (error) {
+        res.status(400).json({ message: "Error al eliminar el abono", error: error.message });
+    }
+});
+
+// --- NUEVA RUTA PARA AGREGAR CUOTAS ADICIONALES ---
+router.post('/credits/:id/add-installments', async (req, res) => {
+    try {
+        const { additionalInstallments } = req.body;
+        const credit = await Credit.findById(req.params.id);
+        
+        if (!credit) {
+            return res.status(404).json({ message: "Crédito no encontrado" });
+        }
+        
+        if (credit.status === 'pagado') {
+            return res.status(400).json({ message: "No se pueden agregar cuotas a un crédito ya pagado" });
+        }
+        
+        // SUMAR las cuotas adicionales a las existentes
+        const newTotalInstallments = credit.installments + additionalInstallments;
+        const newRemainingInstallments = credit.remainingInstallments + additionalInstallments;
+        
+        credit.installments = newTotalInstallments;
+        credit.remainingInstallments = newRemainingInstallments;
+        
+        await credit.save();
+        res.status(200).json(credit);
+        
+    } catch (error) {
+        res.status(400).json({ message: "Error al agregar cuotas adicionales", error: error.message });
+    }
 });
 
 // --- NUEVA RUTA PARA AÑADIR PRODUCTOS ---
@@ -231,22 +355,25 @@ router.post('/credits/:id/add-products', async (req, res) => {
 router.get('/agenda', async (req, res) => {
     try {
         const activeCredits = await Credit.find({ status: 'activo' }).populate('client', 'fullName cedula');
-        const today = new Date();
+        
+        // Obtener la fecha actual en Colombia (UTC-5)
+        const colombiaTime = new Date().toLocaleString("en-US", {timeZone: "America/Bogota"});
+        const today = new Date(colombiaTime);
         today.setHours(0, 0, 0, 0);
-        const upcomingLimit = new Date(today);
-        upcomingLimit.setDate(today.getDate() + 7);
-        const overdue = [];
+        
         const todayPayments = [];
-        const upcoming = [];
         activeCredits.forEach(credit => {
             if (!credit.nextPaymentDate) return;
             const nextPayment = new Date(credit.nextPaymentDate);
             nextPayment.setHours(0, 0, 0, 0);
-            if (nextPayment < today) overdue.push(credit);
-            else if (nextPayment.getTime() === today.getTime()) todayPayments.push(credit);
-            else if (nextPayment > today && nextPayment <= upcomingLimit) upcoming.push(credit);
+            
+            // Solo incluir créditos que se deben pagar exactamente hoy
+            if (nextPayment.getTime() === today.getTime()) {
+                todayPayments.push(credit);
+            }
         });
-        res.status(200).json({ overdue, today: todayPayments, upcoming });
+        
+        res.status(200).json({ today: todayPayments });
     } catch (error) { res.status(500).json({ message: "Error al generar la agenda", error }); }
 });
 
