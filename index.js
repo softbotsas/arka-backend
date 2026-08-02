@@ -8,7 +8,31 @@ const apiRoutes = require('./routes/api'); // Importamos nuestras rutas
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// Orígenes web autorizados a consumir esta API desde el navegador.
+// Se conserva el dominio anterior durante la transición para no interrumpir
+// instalaciones del frontend que aún no se hayan actualizado.
+const allowedOrigins = [
+    'https://arkashops.online',
+    'https://www.arkashops.online',
+    'https://arkasistema.online',
+    'https://www.arkasistema.online'
+];
+
+const corsOptions = {
+    origin(origin, callback) {
+        // Clientes no navegadores (curl, monitoreo interno) no envían Origin.
+        if (!origin || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+
+        return callback(new Error(`Origen no autorizado por CORS: ${origin}`));
+    },
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 mongoose.connect(process.env.MONGODB_URI)
