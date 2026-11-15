@@ -15,7 +15,13 @@ const allowedOrigins = [
     'https://arkashops.online',
     'https://www.arkashops.online',
     'https://arkasistema.online',
-    'https://www.arkasistema.online'
+    'https://www.arkasistema.online',
+    // Orígenes adicionales (p. ej. desarrollo local), separados por coma:
+    // CORS_EXTRA_ORIGINS=http://localhost:5173
+    ...(process.env.CORS_EXTRA_ORIGINS || '')
+        .split(',')
+        .map(o => o.trim())
+        .filter(Boolean)
 ];
 
 const corsOptions = {

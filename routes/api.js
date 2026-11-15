@@ -380,6 +380,84 @@ router.post('/credits/:id/add-products', async (req, res) => {
     }
 });
 
+// --- RUTA PARA EDITAR/ELIMINAR PRODUCTOS DE UN CRÉDITO ---
+// Recibe la lista completa de productos que debe quedar en el crédito.
+// Los productos existentes conservan su _id; los que no vengan se eliminan.
+// La deuda se recalcula desde el historial de abonos para no perder pagos.
+router.put('/credits/:id/products', async (req, res) => {
+    try {
+        const { products, additionalInstallments } = req.body;
+
+        if (!Array.isArray(products) || products.length === 0) {
+            return res.status(400).json({ message: "El crédito debe tener al menos un producto." });
+        }
+
+        const cleanProducts = [];
+        for (const p of products) {
+            const name = typeof p.name === 'string' ? p.name.trim() : '';
+            const price = Number(p.price);
+            if (!name || !Number.isFinite(price) || price <= 0) {
+                return res.status(400).json({ message: "Cada producto necesita nombre y un valor mayor a 0." });
+            }
+            cleanProducts.push({ _id: p._id, name, price });
+        }
+
+        const credit = await Credit.findById(req.params.id);
+        if (!credit) return res.status(404).json({ message: "Crédito no encontrado" });
+
+        // Solo se conservan _id que realmente pertenecen a este crédito
+        const existingIds = new Set(credit.products.map(p => String(p._id)));
+        const newProducts = cleanProducts.map(({ _id, name, price }) =>
+            _id && existingIds.has(String(_id)) ? { _id, name, price } : { name, price }
+        );
+
+        const oldSum = credit.products.reduce((sum, p) => sum + p.price, 0);
+        const newSum = newProducts.reduce((sum, p) => sum + p.price, 0);
+        // Se aplica la diferencia (y no la suma nueva) para respetar ajustes
+        // manuales que se hayan hecho antes al monto original.
+        const newOriginalAmount = credit.originalAmount + (newSum - oldSum);
+        const totalPaid = credit.paymentHistory.reduce((sum, p) => sum + (p.amount || 0), 0);
+        const remainingAmount = newOriginalAmount - totalPaid;
+
+        const extra = parseInt(additionalInstallments, 10) || 0;
+        if (remainingAmount > 0 && credit.remainingInstallments <= 0 && extra < 1) {
+            return res.status(400).json({
+                message: "Al crédito le queda saldo pero no le quedan cuotas. Indica cuántas cuotas agregar.",
+                needsMoreInstallments: true,
+                remainingBalance: remainingAmount
+            });
+        }
+
+        credit.products = newProducts;
+        credit.originalAmount = newOriginalAmount;
+
+        if (remainingAmount <= 0) {
+            if (credit.status !== 'pagado') credit.completionDate = new Date();
+            credit.status = 'pagado';
+            credit.totalAmount = 0;
+            credit.remainingInstallments = 0;
+            credit.nextPaymentDate = null;
+        } else {
+            credit.totalAmount = remainingAmount;
+            if (extra > 0) {
+                credit.installments += extra;
+                credit.remainingInstallments += extra;
+            }
+            if (credit.status === 'pagado') {
+                credit.status = 'activo';
+                credit.completionDate = null;
+                credit.nextPaymentDate = calculateNextPaymentDate(credit);
+            }
+        }
+
+        await credit.save();
+        const populatedCredit = await Credit.findById(credit._id).populate('client');
+        res.status(200).json(populatedCredit);
+    } catch (error) {
+        res.status(400).json({ message: "Error al editar los productos del crédito", error: error.message });
+    }
+});
+
 // --- RUTAS DE AGENDA Y REPORTES ---
 
 router.get('/agenda', async (req, res) => {
